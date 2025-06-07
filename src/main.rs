@@ -1,12 +1,25 @@
-use serde_json::Value;
-use std::env;
+use serde_json::{Map, Value};
 
-// Available if you need it!
-// use serde_bencode
+fn value_length(v: &Value) -> usize {
+    match &v {
+        Value::String(s) => s.len() + s.len().ilog10() as usize + 2,
+        Value::Number(n) => {
+            let n = n.as_i64().unwrap();
+            n.abs().ilog10() as usize + 3 + n.is_negative() as usize
+        }
+        Value::Array(v) => v.iter().map(|x| value_length(x)).sum::<usize>() + 1,
+        Value::Object(o) => {
+            o.iter()
+                .map(|(k, v)| k.len() + 2 + value_length(v))
+                .sum::<usize>()
+                + 2
+        }
+        _ => panic!("unknown value"),
+    }
+}
 
 #[allow(dead_code)]
-fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
-    // If encoded_value starts with a digit, it's a number
+fn decode_bencoded_value(encoded_value: &str) -> Value {
     let type_char = encoded_value.chars().next().unwrap();
 
     if type_char.is_digit(10) {
@@ -15,35 +28,36 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
         let number_string = &encoded_value[..colon_index];
         let number: usize = number_string.parse().unwrap();
         let string = &encoded_value[colon_index + 1..colon_index + 1 + number];
-        return Value::String(string.to_string());
+        Value::String(string.to_string())
     } else if type_char == 'i' {
         // Example: "i52e" -> 52
         let end = encoded_value.find('e').unwrap();
         let number_string = &encoded_value[1..end];
         let number = number_string.parse().unwrap();
-        return Value::Number(number);
+        Value::Number(number)
     } else if type_char == 'l' {
+        // Example "l3:fooi52e" -> [ "foo", 52]
         let mut values = Vec::new();
         let mut i = 1;
         while encoded_value.chars().nth(i) != Some('e') {
             let v = decode_bencoded_value(&encoded_value[i..]);
-            // println!("processing: {}", &encoded_value[i..]);
-
-            let skip = match &v {
-                Value::String(s) => s.len() + 2,
-                Value::Number(n) => {
-                    let n = n.as_i64().unwrap();
-                    n.abs().ilog10() as usize + 3 + n.is_negative() as usize
-                }
-                _ => panic!("unknown value"),
-            };
-
-            // println!("remaining: {}", &encoded_value[i + skip..]);
-            // println!("{} - skip {}", v, skip);
+            i += value_length(&v);
             values.push(v);
-            i += skip;
         }
-        return serde_json::Value::Array(values);
+        Value::Array(values)
+    } else if type_char == 'd' {
+        let mut dict = Map::new();
+        let mut i = 1;
+        while encoded_value.chars().nth(i) != Some('e') {
+            let key = decode_bencoded_value(&encoded_value[i..]);
+            i += value_length(&key);
+
+            let val = decode_bencoded_value(&encoded_value[i..]);
+            i += value_length(&val);
+
+            dict.insert(key.as_str().unwrap().to_string(), val);
+        }
+        Value::Object(dict)
     } else {
         panic!("Unhandled encoded value: {}", encoded_value)
     }
@@ -51,7 +65,7 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
 
 // Usage: your_program.sh decode "<encoded_value>"
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
     let command = &args[1];
 
     if command == "decode" {
