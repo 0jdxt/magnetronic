@@ -1,3 +1,6 @@
+use std::io::{Read, Write};
+use std::net::TcpStream;
+
 #[derive(Debug)]
 pub struct Handshake([u8; 68]);
 
@@ -41,4 +44,19 @@ impl AsRef<[u8]> for Handshake {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
+}
+
+pub fn handshake(stream: &mut TcpStream, info_hash: &[u8]) -> std::io::Result<bool> {
+    // Send handshake, receive & validate handshake response
+    let handshake = Handshake::new(info_hash, &crate::PEER_ID);
+    log::debug!("Sending Handshake: {handshake:?}");
+    stream.write_all(handshake.as_ref())?;
+
+    let mut buf = [0u8; 68];
+    stream.read_exact(&mut buf)?;
+    let handshake = Handshake::from_bytes(buf);
+
+    log::debug!("Recieved Handshake: {handshake:?}");
+    assert!(handshake.validate(info_hash));
+    Ok(handshake.supports_extensions())
 }

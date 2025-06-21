@@ -2,7 +2,7 @@ use std::io::Write;
 use std::net::TcpStream;
 
 #[derive(Debug)]
-pub enum PeerMessage<'a> {
+pub enum Message<'a> {
     Choke,
     Unchoke,
     Interested,
@@ -33,22 +33,22 @@ pub enum PeerMessage<'a> {
     Unknown(u8, &'a [u8]),
 }
 
-impl PeerMessage<'_> {
+impl Message<'_> {
     fn message_id(&self) -> Option<u8> {
         Some(match self {
-            PeerMessage::Choke => 0,
-            PeerMessage::Unchoke => 1,
-            PeerMessage::Interested => 2,
-            PeerMessage::NotInterested => 3,
-            PeerMessage::Have(_) => 4,
-            PeerMessage::Bitfield(_) => 5,
-            PeerMessage::Request { .. } => 6,
-            PeerMessage::Piece { .. } => 7,
-            PeerMessage::Cancel { .. } => 8,
-            PeerMessage::Port(_) => 9,
-            PeerMessage::Extended { .. } => 20,
-            PeerMessage::Unknown(id, _) => *id,
-            PeerMessage::KeepAlive => return None,
+            Message::Choke => 0,
+            Message::Unchoke => 1,
+            Message::Interested => 2,
+            Message::NotInterested => 3,
+            Message::Have(_) => 4,
+            Message::Bitfield(_) => 5,
+            Message::Request { .. } => 6,
+            Message::Piece { .. } => 7,
+            Message::Cancel { .. } => 8,
+            Message::Port(_) => 9,
+            Message::Extended { .. } => 20,
+            Message::Unknown(id, _) => *id,
+            Message::KeepAlive => return None,
         })
     }
 
@@ -60,27 +60,24 @@ impl PeerMessage<'_> {
         let mut buf = Vec::new();
 
         match self {
-            PeerMessage::KeepAlive => {
+            Message::KeepAlive => {
                 buf.extend(&0u32.to_be_bytes());
             }
-            PeerMessage::Choke
-            | PeerMessage::Unchoke
-            | PeerMessage::Interested
-            | PeerMessage::NotInterested => {
+            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested => {
                 buf.extend(&1u32.to_be_bytes());
                 buf.push(self.message_id().unwrap());
             }
-            PeerMessage::Have(index) => {
+            Message::Have(index) => {
                 buf.extend(&5u32.to_be_bytes());
                 buf.push(4);
                 buf.extend(&index.to_be_bytes());
             }
-            PeerMessage::Bitfield(bitfield) => {
+            Message::Bitfield(bitfield) => {
                 buf.extend(&(1 + bitfield.len() as u32).to_be_bytes());
                 buf.push(5);
                 buf.extend(*bitfield);
             }
-            PeerMessage::Request {
+            Message::Request {
                 index,
                 begin,
                 length,
@@ -91,7 +88,7 @@ impl PeerMessage<'_> {
                 buf.extend(begin.to_be_bytes());
                 buf.extend(length.to_be_bytes());
             }
-            PeerMessage::Cancel {
+            Message::Cancel {
                 index,
                 begin,
                 length,
@@ -102,47 +99,47 @@ impl PeerMessage<'_> {
                 buf.extend(begin.to_be_bytes());
                 buf.extend(length.to_be_bytes());
             }
-            PeerMessage::Port(port) => {
+            Message::Port(port) => {
                 buf.extend(3u32.to_be_bytes());
                 buf.push(9);
                 buf.extend(port.to_be_bytes());
             }
-            PeerMessage::Extended { id, payload } => {
+            Message::Extended { id, payload } => {
                 buf.extend((payload.len() as u32 + 2).to_be_bytes());
                 buf.push(20);
                 buf.push(*id);
                 buf.extend(*payload);
             }
-            PeerMessage::Unknown(first, data) => {
+            Message::Unknown(first, data) => {
                 buf.push(*first);
                 buf.extend(*data);
             }
-            PeerMessage::Piece { .. } => unreachable!("Tried to create a piece!"),
+            Message::Piece { .. } => unreachable!("Tried to create a piece!"),
         }
 
         buf
     }
 }
 
-impl<'a> From<&'a mut [u8]> for PeerMessage<'a> {
+impl<'a> From<&'a mut [u8]> for Message<'a> {
     fn from(buf: &'a mut [u8]) -> Self {
         let id = buf[0];
         let payload = &buf[1..];
         match id {
-            0 => PeerMessage::Choke,
-            1 => PeerMessage::Unchoke,
-            2 => PeerMessage::Interested,
-            3 => PeerMessage::NotInterested,
+            0 => Message::Choke,
+            1 => Message::Unchoke,
+            2 => Message::Interested,
+            3 => Message::NotInterested,
             4 => {
                 let index = u32::from_be_bytes(payload[0..4].try_into().unwrap());
-                PeerMessage::Have(index)
+                Message::Have(index)
             }
-            5 => PeerMessage::Bitfield(payload),
+            5 => Message::Bitfield(payload),
             6 => {
                 let index = u32::from_be_bytes(payload[0..4].try_into().unwrap());
                 let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
                 let length = u32::from_be_bytes(payload[8..12].try_into().unwrap());
-                PeerMessage::Request {
+                Message::Request {
                     index,
                     begin,
                     length,
@@ -152,7 +149,7 @@ impl<'a> From<&'a mut [u8]> for PeerMessage<'a> {
                 let index = u32::from_be_bytes(payload[0..4].try_into().unwrap());
                 let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
                 let block = &payload[8..];
-                PeerMessage::Piece {
+                Message::Piece {
                     index,
                     begin,
                     block,
@@ -162,7 +159,7 @@ impl<'a> From<&'a mut [u8]> for PeerMessage<'a> {
                 let index = u32::from_be_bytes(payload[0..4].try_into().unwrap());
                 let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
                 let length = u32::from_be_bytes(payload[8..12].try_into().unwrap());
-                PeerMessage::Cancel {
+                Message::Cancel {
                     index,
                     begin,
                     length,
@@ -170,13 +167,13 @@ impl<'a> From<&'a mut [u8]> for PeerMessage<'a> {
             }
             9 => {
                 let port = u16::from_be_bytes(payload[0..2].try_into().unwrap());
-                PeerMessage::Port(port)
+                Message::Port(port)
             }
-            20 => PeerMessage::Extended {
+            20 => Message::Extended {
                 id: payload[0],
                 payload: &payload[1..],
             },
-            _ => PeerMessage::Unknown(id, payload),
+            _ => Message::Unknown(id, payload),
         }
     }
 }

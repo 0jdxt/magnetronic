@@ -2,64 +2,19 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
-mod handshake;
-use handshake::Handshake;
-
 mod bencode;
+mod handshake;
+mod peer;
+mod peers;
 
-mod peer_message;
-use peer_message::PeerMessage;
-
-use percent_encoding::{percent_decode_str, percent_encode, NON_ALPHANUMERIC};
-use sha1::{Digest, Sha1};
+// modules
+// std
 use std::fs::OpenOptions;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
-
-struct Piece {
-    data: Vec<u8>,
-    blocks_downloaded: Vec<bool>,
-    block_size: usize,
-    total_size: usize,
-}
-
-impl Piece {
-    fn new(total_size: usize, block_size: usize) -> Self {
-        let num_blocks = total_size.div_ceil(block_size);
-        Self {
-            data: vec![0; total_size],
-            blocks_downloaded: vec![false; num_blocks],
-            block_size,
-            total_size,
-        }
-    }
-
-    fn write_block(&mut self, begin: usize, block: &[u8]) {
-        let end = begin + block.len();
-        assert!(end <= self.total_size, "Block write out of bounds");
-
-        self.data[begin..end].copy_from_slice(block);
-
-        let block_index = begin / self.block_size;
-        self.blocks_downloaded[block_index] = true;
-    }
-
-    fn is_complete(&self) -> bool {
-        self.blocks_downloaded.iter().all(|&b| b)
-    }
-
-    fn next_request(&self) -> Option<(usize, usize)> {
-        for (i, &downloaded) in self.blocks_downloaded.iter().enumerate() {
-            if !downloaded {
-                let begin = i * self.block_size;
-                let remaining = self.total_size - begin;
-                let length = remaining.min(self.block_size);
-                return Some((begin, length));
-            }
-        }
-        None
-    }
-}
+// cargo
+use percent_encoding::percent_decode_str;
+use sha1::{Digest, Sha1};
 
 #[derive(Debug)]
 struct TorrentInfo {
@@ -161,101 +116,16 @@ fn parse_magnet_link(uri: &str) -> Option<MagnetInfo> {
     })
 }
 
-trait NeedsPeers<'i> {
-    fn get_tracker(&'i self) -> &'i str;
-    fn get_hash(&'i self) -> &'i [u8];
-    fn get_left(&'i self) -> &'i usize;
-}
-
-impl<'t> NeedsPeers<'t> for TorrentInfo {
-    fn get_tracker(&'t self) -> &'t str {
-        &self.trackers[0]
-    }
-    fn get_hash(&'t self) -> &'t [u8] {
-        &self.info_hash
-    }
-
-    fn get_left(&'t self) -> &'t usize {
-        &self.total_length
-    }
-}
-
-impl<'m> NeedsPeers<'m> for MagnetInfo<'_> {
-    fn get_tracker(&'m self) -> &'m str {
-        &self.trackers[0]
-    }
-    fn get_hash(&'m self) -> &'m [u8] {
-        &self.info_hash
-    }
-    fn get_left(&'m self) -> &'m usize {
-        &1
-    }
-}
-
-async fn request_peers<'i, I>(info: &'i I) -> Vec<SocketAddr>
-where
-    I: NeedsPeers<'i>,
-{
-    // Build tracker URL with params & send request
-    // Parse response for peers (compact format)
-
-    let info_hash_encoded = percent_encode(info.get_hash(), NON_ALPHANUMERIC).to_string();
-    let peer_id_encoded = percent_encode(&PEER_ID, NON_ALPHANUMERIC).to_string();
-
-    let url = format!(
-        "{}?info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left={}&compact=1&event=started",
-        info.get_tracker(),
-        info_hash_encoded,
-        peer_id_encoded,
-        info.get_left()
-    );
-    log::debug!("requesting: {url}");
-
-    let res = reqwest::get(&url).await.unwrap().bytes().await.unwrap();
-    log::debug!("{res:?}");
-
-    let (resp, _) = bencode::decode(&res);
-    log::debug!("{resp:?}");
-
-    match resp.get(b"peers").expect("No peers recieved!") {
-        bencode::Value::ByteString(v) => v
-            .chunks_exact(6)
-            .map(|chunk| {
-                SocketAddr::from((
-                    [chunk[0], chunk[1], chunk[2], chunk[3]],
-                    u16::from_be_bytes([chunk[4], chunk[5]]),
-                ))
-            })
-            .collect(),
-        _ => unreachable!("peers not a ByteString!"),
-    }
-}
-
-fn handshake(stream: &mut TcpStream, info_hash: &[u8]) -> std::io::Result<bool> {
-    // Send handshake, receive & validate handshake response
-    let handshake = Handshake::new(info_hash, &PEER_ID);
-    log::debug!("Sending Handshake: {handshake:?}");
-    stream.write_all(handshake.as_ref())?;
-
-    let mut buf = [0u8; 68];
-    stream.read_exact(&mut buf)?;
-    let handshake = Handshake::from_bytes(buf);
-
-    log::debug!("Recieved Handshake: {handshake:?}");
-    assert!(handshake.validate(info_hash));
-    Ok(handshake.supports_extensions())
-}
-
 fn retrieve_message<'a>(
     reader: &'a mut BufReader<TcpStream>,
     buffer: &'a mut [u8],
-) -> std::io::Result<PeerMessage<'a>> {
+) -> std::io::Result<peer::Message<'a>> {
     let mut len_buf = [0; 4];
     reader.read_exact(&mut len_buf)?;
     let length = u32::from_be_bytes(len_buf);
 
     Ok(if length == 0 {
-        PeerMessage::KeepAlive
+        peer::Message::KeepAlive
     } else {
         let slice = &mut buffer[..length as usize];
         reader.read_exact(slice)?;
@@ -268,13 +138,13 @@ async fn fetch_torrent_info_from_magnet(magnet: &str) -> std::io::Result<(Torren
     log::debug!("MagnetInfo: {magnet:?}");
     log::info!("Fetching metadata for {:?}", magnet.name);
 
-    let peers = request_peers(&magnet).await;
+    let peers = peers::request_peers(&magnet).await;
     log::debug!("{peers:?}");
 
     let peer = peers[0];
     log::info!("Connecting to peer {peer}");
     let mut stream = TcpStream::connect(peer)?;
-    let supports_extensions = handshake(&mut stream, &magnet.info_hash)?;
+    let supports_extensions = handshake::handshake(&mut stream, &magnet.info_hash)?;
     assert!(
         supports_extensions,
         "Magnet tracker doesnt support extensions"
@@ -290,7 +160,7 @@ async fn fetch_torrent_info_from_magnet(magnet: &str) -> std::io::Result<(Torren
         "Tracker for magnet doesnt support extensions"
     );
 
-    let extended = PeerMessage::Extended {
+    let extended = peer::Message::Extended {
         id: 0,
         payload: b"d1:md11:ut_metadatai16eee",
     };
@@ -299,7 +169,7 @@ async fn fetch_torrent_info_from_magnet(magnet: &str) -> std::io::Result<(Torren
     extended.send(&mut stream)?;
 
     let reply = retrieve_message(&mut reader, &mut msg_buf)?;
-    assert!(matches!(reply, PeerMessage::Extended { .. }));
+    assert!(matches!(reply, peer::Message::Extended { .. }));
     log::debug!("{reply:?}");
 
     let ext_bytes = reply.to_bytes();
@@ -309,7 +179,7 @@ async fn fetch_torrent_info_from_magnet(magnet: &str) -> std::io::Result<(Torren
     let metadata_id = dict.get(b"m").unwrap().get(b"ut_metadata").unwrap();
     log::debug!("metadata_id: {metadata_id}");
 
-    let req = &PeerMessage::Extended {
+    let req = &peer::Message::Extended {
         id: metadata_id.as_int().unwrap() as u8,
         payload: b"d8:msg_typei0e5:piecei0ee",
     };
@@ -317,7 +187,7 @@ async fn fetch_torrent_info_from_magnet(magnet: &str) -> std::io::Result<(Torren
     req.send(&mut stream)?;
 
     let msg = retrieve_message(&mut reader, &mut msg_buf)?;
-    assert!(matches!(msg, PeerMessage::Extended { .. }));
+    assert!(matches!(msg, peer::Message::Extended { .. }));
     log::debug!("{msg:?}");
 
     let msg_bytes = msg.to_bytes();
@@ -368,7 +238,7 @@ async fn main() -> std::io::Result<()> {
 
     let (torrent, mut stream) = if args[1].starts_with("magnet:?") {
         let (t, mut s) = fetch_torrent_info_from_magnet(&args[1]).await?;
-        PeerMessage::Interested.send(&mut s)?;
+        peer::Message::Interested.send(&mut s)?;
         (t, s)
     } else {
         let bytes = std::fs::read(&args[1]).unwrap();
@@ -378,13 +248,13 @@ async fn main() -> std::io::Result<()> {
 
         let mut t =
             parse_torrent_file(&torrent_info_dict).expect("Failed to get TorrentInfo from file");
-        t.peers = request_peers(&t).await;
+        t.peers = peers::request_peers(&t).await;
 
         let peer = t.peers[0];
         log::info!("Connecting to {peer}");
         let mut stream = TcpStream::connect(peer)?;
 
-        handshake(&mut stream, &t.info_hash)?;
+        handshake::handshake(&mut stream, &t.info_hash)?;
 
         (t, stream)
     };
@@ -394,7 +264,7 @@ async fn main() -> std::io::Result<()> {
 
     let bitfield_len = torrent.piece_hashes.len().div_ceil(8);
     let empty_bitfield = vec![0u8; bitfield_len];
-    PeerMessage::Bitfield(&empty_bitfield).send(&mut stream)?;
+    peer::Message::Bitfield(&empty_bitfield).send(&mut stream)?;
 
     let mut availability = vec![0u8; torrent.piece_hashes.len()];
     log::info!("Waiting for Unchoke");
@@ -405,7 +275,7 @@ async fn main() -> std::io::Result<()> {
         log::debug!("Recieved: {message:?}");
 
         let reply = match message {
-            PeerMessage::Bitfield(field) => {
+            peer::Message::Bitfield(field) => {
                 for (i, byte) in field.iter().enumerate() {
                     for bit_pos in 0..8 {
                         let piece_index = i * 8 + bit_pos;
@@ -415,10 +285,10 @@ async fn main() -> std::io::Result<()> {
                     }
                 }
                 log::debug!("availability: {availability:?}");
-                PeerMessage::Interested
+                peer::Message::Interested
             }
-            PeerMessage::KeepAlive => PeerMessage::KeepAlive,
-            PeerMessage::Unchoke => break,
+            peer::Message::KeepAlive => peer::Message::KeepAlive,
+            peer::Message::Unchoke => break,
             m => {
                 log::warn!("Unexpected message waiting for Unchoke: {m:?}");
                 continue;
@@ -445,10 +315,10 @@ async fn main() -> std::io::Result<()> {
             torrent.piece_length
         };
 
-        let mut piece = Piece::new(length, BLOCK_SIZE);
+        let mut piece = peer::Piece::new(length, BLOCK_SIZE);
 
         if let Some((begin, length)) = piece.next_request() {
-            PeerMessage::Request {
+            peer::Message::Request {
                 index: i as u32,
                 begin: begin as u32,
                 length: length as u32,
@@ -460,8 +330,8 @@ async fn main() -> std::io::Result<()> {
             let message = retrieve_message(&mut reader, &mut buffer)?;
 
             let reply = match message {
-                PeerMessage::KeepAlive => PeerMessage::KeepAlive,
-                PeerMessage::Piece {
+                peer::Message::KeepAlive => peer::Message::KeepAlive,
+                peer::Message::Piece {
                     index,
                     begin,
                     block,
@@ -479,7 +349,7 @@ async fn main() -> std::io::Result<()> {
                     }
 
                     if let Some((next_begin, next_length)) = piece.next_request() {
-                        PeerMessage::Request {
+                        peer::Message::Request {
                             index,
                             begin: next_begin as u32,
                             length: next_length as u32,
