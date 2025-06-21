@@ -210,7 +210,6 @@ dependencies = [
  "regex",
  "reqwest",
  "serde",
- "serde_bencode",
  "serde_bytes",
  "serde_json",
  "serde_urlencoded",
@@ -1124,16 +1123,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f55c3193aca71c12ad7890f1785d2b73e1b9f63a0bbc353c08ef26fe03fc56b5"
 dependencies = [
  "serde_derive",
-]
-
-[[package]]
-name = "serde_bencode"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a70dfc7b7438b99896e7f8992363ab8e2c4ba26aa5ec675d32d1c3c2c33d413e"
-dependencies = [
- "serde",
- "serde_bytes",
 ]
 
 [[package]]
