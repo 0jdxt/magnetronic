@@ -1,5 +1,4 @@
-use std::io::Write;
-use std::net::TcpStream;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
 pub enum Message<'a> {
@@ -52,8 +51,11 @@ impl Message<'_> {
         })
     }
 
-    pub fn send(&self, stream: &mut TcpStream) -> std::io::Result<()> {
-        stream.write_all(&self.to_bytes())
+    pub async fn send<W: AsyncWriteExt + std::marker::Unpin>(
+        &self,
+        stream: &mut W,
+    ) -> std::io::Result<()> {
+        stream.write_all(&self.to_bytes()).await
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
