@@ -1,2 +1,3 @@
-# Magnetron
+# Magnetronic
+
 A new torrent client
