@@ -1,7 +1,7 @@
 [package]
-name = "codecrafters-bittorrent"
+name = "magnetronic-core"
 version = "0.1.0"
-authors = ["Codecrafters <hello@codecrafters.io>"]
+authors = ["Jay Tauron <jay@jaytauron.xyz>"]
 edition = "2021"
 
 [dependencies]
