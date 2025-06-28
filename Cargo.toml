@@ -8,6 +8,7 @@ edition = "2021"
 anyhow = "1.0.68"                                                  # error handling
 bytes = "1.3.0"                                                    # helps wrap responses from reqwest
 clap = { version = "4.0.32", features = ["derive"]}                # creating a cli
+data-encoding = "2.9.0"
 env_logger = "0.11.8"
 hex = "0.4.3"
 log = "0.4.27"

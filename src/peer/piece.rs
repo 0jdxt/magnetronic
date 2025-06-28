@@ -1,8 +1,8 @@
 pub struct Piece {
     pub data: Vec<u8>,
-    blocks_downloaded: Vec<bool>,
-    block_size: usize,
-    total_size: usize,
+    pub blocks_downloaded: Vec<bool>,
+    pub block_size: usize,
+    pub total_size: usize,
 }
 
 impl Piece {

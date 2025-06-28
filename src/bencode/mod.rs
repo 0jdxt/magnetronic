@@ -1,54 +1,107 @@
 use std::collections::HashMap;
 use std::str;
+use thiserror::Error;
 
 pub mod value;
-pub use value::Value;
+pub use value::*;
 
-pub fn decode(bytes: &[u8]) -> (Value, usize) {
-    match bytes[0] {
+#[derive(Debug, Error, PartialEq)]
+pub enum Error {
+    #[error("Expected ByteString but found {0:?}")]
+    NotByteString(Value),
+
+    #[error("Expected Integer but found {0:?}")]
+    NotInteger(Value),
+
+    #[error("Expected Dict but found {0:?}")]
+    NotDict(Value),
+
+    #[error("Expected List but found {0:?}")]
+    NotList(Value),
+
+    #[error("Invalid UTF-8 in Bencode: {0}")]
+    Utf8(#[from] std::str::Utf8Error),
+
+    #[error("Invalid integer in Bencode: {0}")]
+    ParseInt(#[from] std::num::ParseIntError),
+
+    #[error("Invalid format: missing ':' for string length")]
+    MissingColon,
+
+    #[error("Invalid format: missing 'e' terminator")]
+    MissingEnd,
+
+    #[error("Invalid format: expected ByteString key in dict")]
+    NonByteStringKey,
+
+    #[error("Unexpected end of input")]
+    UnexpectedEof,
+
+    #[error("Unhandled byte: {0} (char: {1:?})")]
+    UnhandledByte(u8, Option<char>),
+}
+
+pub fn decode(bytes: &[u8]) -> Result<(Value, usize), Error> {
+    match bytes.first().ok_or(Error::UnexpectedEof)? {
         b'0'..=b'9' => {
             // Example: "5:hello" -> "hello"
-            let colon_index = bytes.iter().position(|&b| b == b':').unwrap();
-            let len: usize = str::from_utf8(&bytes[..colon_index])
-                .unwrap()
-                .parse()
-                .unwrap();
+            let colon_index = bytes
+                .iter()
+                .position(|&b| b == b':')
+                .ok_or(Error::MissingColon)?;
+            let len: usize = str::from_utf8(&bytes[..colon_index])?.parse()?;
             let start = colon_index + 1;
-            let end = start + len;
-            (Value::ByteString(bytes[start..end].into()), end)
+            let end = start.checked_add(len).ok_or(Error::UnexpectedEof)?;
+            if end > bytes.len() {
+                Err(Error::UnexpectedEof)
+            } else {
+                Ok((Value::ByteString(bytes[start..end].into()), end))
+            }
         }
         b'i' => {
             // Example: "i52e" -> 52
-            let end = bytes.iter().position(|&b| b == b'e').unwrap();
-            let number = str::from_utf8(&bytes[1..end]).unwrap().parse().unwrap();
-            (Value::Integer(number), end + 1)
+            let end = bytes
+                .iter()
+                .position(|&b| b == b'e')
+                .ok_or(Error::MissingEnd)?;
+            let number = str::from_utf8(&bytes[1..end])?.parse()?;
+            Ok((Value::Integer(number), end + 1))
         }
         b'l' => {
             // Example "l3:fooi52e" -> [ "foo", 52]
             let mut values = Vec::new();
             let mut i = 1;
-            while bytes[i] != b'e' {
-                let (v, len) = decode(&bytes[i..]);
+            while i < bytes.len() && bytes[i] != b'e' {
+                let (v, len) = decode(&bytes[i..])?;
                 values.push(v);
                 i += len;
             }
-            (Value::List(values), i + 1)
+            if i >= bytes.len() {
+                Err(Error::MissingEnd)
+            } else {
+                Ok((Value::List(values), i + 1))
+            }
         }
         b'd' => {
             let mut dict = HashMap::new();
             let mut i = 1;
-            while bytes[i] != b'e' {
-                let (key, len_k) = decode(&bytes[i..]);
+            while i < bytes.len() && bytes[i] != b'e' {
+                let (key, len_k) = decode(&bytes[i..])?;
                 i += len_k;
+                let key = key.try_into().map_err(|_| Error::NonByteStringKey)?;
 
-                let (val, len_v) = decode(&bytes[i..]);
+                let (val, len_v) = decode(&bytes[i..])?;
                 i += len_v;
 
-                dict.insert(key.try_into().unwrap(), val);
+                dict.insert(key, val);
             }
-            (Value::Dict(dict), i + 1)
+            if i >= bytes.len() {
+                Err(Error::MissingEnd)
+            } else {
+                Ok((Value::Dict(dict), i + 1))
+            }
         }
-        b => unreachable!("unhandled byte: {} {:?}", b, str::from_utf8(bytes)),
+        b => Err(Error::UnhandledByte(*b, Some(*b as char))),
     }
 }
 
@@ -83,3 +136,6 @@ pub fn encode(value: &Value) -> Vec<u8> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

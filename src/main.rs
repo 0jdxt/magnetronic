@@ -1,8 +1,7 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_sign_loss)]
 mod bencode;
+mod error;
 mod handshake;
 mod magnet;
 mod peer;
@@ -10,43 +9,28 @@ mod peers;
 mod torrent;
 
 // modules
+use error::TorrentError;
 use magnet::fetch_torrent_info_from_magnet;
 use magnet::MagnetInfo;
 use torrent::parse_torrent_file;
 use torrent::TorrentInfo;
 // cargo
 use sha1::{Digest, Sha1};
-use tokio::fs::OpenOptions;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom};
-use tokio::net::TcpStream;
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
+    net::TcpStream,
+};
+
+use crate::peer::{retrieve_message, Message};
 
 const PEER_ID: &[u8; 20] = b"-TR2940-6wfG2wk6wWLc";
 const BLOCK_SIZE: usize = 16 * 1024; // 16KB blocks
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1MB max
 
-async fn retrieve_message<'a, R: AsyncReadExt + std::marker::Unpin>(
-    // reader: &'a mut BufReader<TcpStream>,
-    reader: &'a mut R,
-    buffer: &'a mut [u8],
-) -> std::io::Result<peer::Message<'a>> {
-    let mut len_buf = [0; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let length = u32::from_be_bytes(len_buf);
-
-    Ok(match length {
-        0 => peer::Message::KeepAlive,
-        1..=MAX_MESSAGE_SIZE => {
-            let slice = &mut buffer[..length as usize];
-            reader.read_exact(slice).await?;
-            slice.into()
-        }
-        _ => panic!("recieved oversized message: {length}"),
-    })
-}
-
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> Result<(), error::TorrentError> {
     env_logger::Builder::from_default_env()
         .format_target(false)
         .format_file(true)
@@ -66,12 +50,12 @@ async fn main() -> std::io::Result<()> {
     } else {
         let bytes = std::fs::read(&args[1]).unwrap();
 
-        let (torrent_info_dict, _) = bencode::decode(&bytes);
+        let (torrent_info_dict, _) = bencode::decode(&bytes)?;
         log::debug!("{torrent_info_dict}");
 
         let mut t =
             parse_torrent_file(&torrent_info_dict).expect("Failed to get TorrentInfo from file");
-        t.peers = peers::request_peers(&t).await;
+        t.peers = peers::request_peers(&t).await?;
 
         let peer = t.peers[0];
         log::info!("Connecting to {peer}");
@@ -94,7 +78,7 @@ async fn main() -> std::io::Result<()> {
 
     let mut buffer = vec![0u8; torrent.piece_length];
     loop {
-        let message = retrieve_message(&mut reader, &mut buffer).await?;
+        let message = retrieve_message(&mut reader, &mut buffer, Some(&torrent)).await?;
         log::debug!("Recieved: {message:?}");
 
         let reply = match message {
@@ -130,29 +114,34 @@ async fn main() -> std::io::Result<()> {
         .open(&torrent.filename)
         .await?;
 
-    file.set_len(torrent.total_length as u64).await?;
+    file.set_len(torrent.total_length).await?;
 
-    let reader = reader.get_mut();
     for (i, expected_hash) in torrent.piece_hashes.iter().enumerate() {
         log::info!("Downloading piece {i}");
 
         let piece_offset = i * torrent.piece_length;
-        let length = (torrent.total_length - piece_offset).min(torrent.piece_length);
+        let length = {
+            let remaining = torrent
+                .total_length
+                .checked_sub(piece_offset as u64)
+                .ok_or_else(|| TorrentError::TorrentParse("Invalid piece offset".into()))?;
+
+            remaining
+                .min(torrent.piece_length as u64)
+                .try_into()
+                .map_err(|_| TorrentError::TorrentParse("piece length exceeds usize".into()))?
+        };
 
         let mut piece = peer::Piece::new(length, BLOCK_SIZE);
 
         if let Some((begin, length)) = piece.next_request() {
-            peer::Message::Request {
-                index: i as u32,
-                begin: begin as u32,
-                length: length as u32,
-            }
-            .send(&mut writer_half)
-            .await?;
+            Message::make_request(i, begin, length)?
+                .send(&mut writer_half)
+                .await?;
         }
 
         loop {
-            let message = retrieve_message(reader, &mut buffer).await?;
+            let message = retrieve_message(&mut reader, &mut buffer, Some(&torrent)).await?;
 
             let reply = match message {
                 peer::Message::KeepAlive => peer::Message::KeepAlive,
@@ -174,11 +163,7 @@ async fn main() -> std::io::Result<()> {
                     }
 
                     if let Some((next_begin, next_length)) = piece.next_request() {
-                        peer::Message::Request {
-                            index,
-                            begin: next_begin as u32,
-                            length: next_length as u32,
-                        }
+                        Message::make_request(i, next_begin, next_length)?
                     } else {
                         continue;
                     }
@@ -193,11 +178,9 @@ async fn main() -> std::io::Result<()> {
             reply.send(&mut writer_half).await?;
         }
 
-        assert_eq!(
-            Sha1::digest(&piece.data).as_slice(),
-            expected_hash.as_slice(),
-            "Piece {i} failed hash check!"
-        );
+        if Sha1::digest(&piece.data).as_slice() != expected_hash.as_slice() {
+            return Err(error::TorrentError::PieceHashMismatch(i));
+        }
 
         log::debug!("first bytes: {:?}", &piece.data[..10]);
         log::debug!("last byte: {:?}", &piece.data[piece.data.len() - 1]);

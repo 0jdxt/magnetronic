@@ -1,8 +1,10 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::error;
+
 #[derive(Debug)]
-pub struct Handshake([u8; 68]);
+pub struct Handshake(pub [u8; 68]);
 
 impl Handshake {
     pub fn new(info_hash: &[u8], peer_id: &[u8]) -> Self {
@@ -13,10 +15,6 @@ impl Handshake {
         buf[28..48].copy_from_slice(info_hash);
         buf[48..68].copy_from_slice(peer_id);
         Self(buf)
-    }
-
-    pub fn from_bytes(bytes: [u8; 68]) -> Self {
-        Self(bytes)
     }
 
     pub fn supports_extensions(&self) -> bool {
@@ -40,23 +38,23 @@ impl Handshake {
     }
 }
 
-impl AsRef<[u8]> for Handshake {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-pub async fn handshake(stream: &mut TcpStream, info_hash: &[u8]) -> std::io::Result<bool> {
+pub async fn handshake(
+    stream: &mut TcpStream,
+    info_hash: &[u8],
+) -> Result<bool, error::TorrentError> {
     // Send handshake, receive & validate handshake response
     let handshake = Handshake::new(info_hash, crate::PEER_ID);
     log::debug!("Sending Handshake: {handshake:?}");
-    stream.write_all(handshake.as_ref()).await?;
+    stream.write_all(&handshake.0).await?;
 
     let mut buf = [0u8; 68];
     stream.read_exact(&mut buf).await?;
-    let handshake = Handshake::from_bytes(buf);
+    let handshake = Handshake(buf);
 
     log::debug!("Recieved Handshake: {handshake:?}");
-    assert!(handshake.validate(info_hash));
-    Ok(handshake.supports_extensions())
+    if handshake.validate(info_hash) {
+        Ok(handshake.supports_extensions())
+    } else {
+        Err(error::TorrentError::HandshakeMismatch)
+    }
 }

@@ -1,11 +1,11 @@
-use crate::bencode;
+use crate::{bencode, error};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use std::net::SocketAddr;
 
 pub trait NeedsPeers<'i> {
     fn get_tracker(&'i self) -> &'i str;
     fn get_hash(&'i self) -> &'i [u8];
-    fn get_left(&'i self) -> &'i usize;
+    fn get_left(&'i self) -> &'i u64;
 }
 
 impl<'t> NeedsPeers<'t> for crate::TorrentInfo {
@@ -16,7 +16,7 @@ impl<'t> NeedsPeers<'t> for crate::TorrentInfo {
         &self.info_hash
     }
 
-    fn get_left(&'t self) -> &'t usize {
+    fn get_left(&'t self) -> &'t u64 {
         &self.total_length
     }
 }
@@ -28,12 +28,14 @@ impl<'m> NeedsPeers<'m> for crate::MagnetInfo<'_> {
     fn get_hash(&'m self) -> &'m [u8] {
         &self.info_hash
     }
-    fn get_left(&'m self) -> &'m usize {
+    fn get_left(&'m self) -> &'m u64 {
         &1
     }
 }
 
-pub async fn request_peers<'i, I: NeedsPeers<'i>>(info: &'i I) -> Vec<SocketAddr> {
+pub async fn request_peers<'i, I: NeedsPeers<'i>>(
+    info: &'i I,
+) -> Result<Vec<SocketAddr>, error::TorrentError> {
     // Build tracker URL with params & send request
     // Parse response for peers (compact format)
 
@@ -49,22 +51,36 @@ pub async fn request_peers<'i, I: NeedsPeers<'i>>(info: &'i I) -> Vec<SocketAddr
     );
     log::debug!("requesting: {url}");
 
-    let res = reqwest::get(&url).await.unwrap().bytes().await.unwrap();
+    let res = reqwest::get(&url).await?;
     log::debug!("{res:?}");
+    if !res.status().is_success() {
+        return Err(error::TorrentError::TrackerHttp(res.status()));
+    }
 
-    let (resp, _) = bencode::decode(&res);
+    let bytes = res.bytes().await?;
+    let (resp, _) = bencode::decode(&bytes)?;
     log::debug!("{resp:?}");
 
-    match resp.get(b"peers").expect("No peers recieved!") {
-        bencode::Value::ByteString(v) => v
-            .chunks_exact(6)
-            .map(|chunk| {
-                SocketAddr::from((
-                    [chunk[0], chunk[1], chunk[2], chunk[3]],
-                    u16::from_be_bytes([chunk[4], chunk[5]]),
-                ))
-            })
-            .collect(),
-        _ => unreachable!("peers not a ByteString!"),
+    match resp.get(b"peers")? {
+        Some(bencode::Value::ByteString(v)) if v.len() % 6 == 0 => {
+            let peers = v
+                .chunks_exact(6)
+                .map(|chunk| {
+                    SocketAddr::from((
+                        [chunk[0], chunk[1], chunk[2], chunk[3]],
+                        u16::from_be_bytes([chunk[4], chunk[5]]),
+                    ))
+                })
+                .collect();
+            Ok(peers)
+        }
+        Some(bencode::Value::ByteString(v)) => {
+            log::warn!("Peers byte string length not multiple of 6: {}", v.len());
+            Err(error::TorrentError::NoPeers)
+        }
+        value => {
+            log::warn!("Invalid peers field: '{value:?}'");
+            Err(error::TorrentError::NoPeers)
+        }
     }
 }

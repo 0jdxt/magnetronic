@@ -1,3 +1,4 @@
+use super::Error;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::str;
@@ -6,13 +7,12 @@ use std::str;
 pub struct Key(pub Vec<u8>);
 
 impl TryFrom<Value> for Key {
-    type Error = &'static str;
+    type Error = Error;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        if let Value::ByteString(b) = value {
-            Ok(Key(b))
-        } else {
-            Err("Only ByteString variants can be converted to Key")
+        match value {
+            Value::ByteString(b) => Ok(Key(b)),
+            _ => Err(Error::NotByteString(value)),
         }
     }
 }
@@ -34,24 +34,31 @@ pub enum Value {
 }
 
 impl Value {
-    pub fn get(&self, bs: &[u8]) -> Option<&Self> {
+    pub fn get(&self, bs: &[u8]) -> Result<Option<&Self>, Error> {
         match self {
-            Self::Dict(d) => d.get(&Key(bs.to_vec())),
-            _ => None,
+            Self::Dict(d) => Ok(d.get(&Key(bs.to_vec()))),
+            _ => Err(Error::NotDict(self.clone())),
         }
     }
 
-    pub fn as_int(&self) -> Option<i64> {
+    pub fn get_index(&self, idx: usize) -> Result<Option<&Self>, Error> {
         match self {
-            Self::Integer(n) => Some(*n),
-            _ => None,
+            Self::List(list) => Ok(list.get(idx)),
+            _ => Err(Error::NotList(self.clone())),
         }
     }
 
-    pub fn as_str(&self) -> Option<&str> {
+    pub fn as_int(&self) -> Result<i64, Error> {
         match self {
-            Self::ByteString(slice) => str::from_utf8(slice).ok(),
-            _ => None,
+            Self::Integer(n) => Ok(*n),
+            _ => Err(Error::NotInteger(self.clone())),
+        }
+    }
+
+    pub fn as_str(&self) -> Result<&str, Error> {
+        match self {
+            Self::ByteString(slice) => Ok(str::from_utf8(slice)?),
+            _ => Err(Error::NotByteString(self.clone())),
         }
     }
 }
@@ -72,7 +79,8 @@ impl std::fmt::Display for Value {
                     }
                     write!(f, "{v}")?;
                 }
-                write!(f, "]")
+                write!(f, "]")?;
+                Ok(())
             }
             Value::Dict(m) => {
                 write!(f, "{{")?;
@@ -82,7 +90,8 @@ impl std::fmt::Display for Value {
                     }
                     write!(f, "{}: {}", str::from_utf8(&k.0).unwrap_or("<?>"), v)?;
                 }
-                write!(f, "}}")
+                write!(f, "}}")?;
+                Ok(())
             }
         }
     }
