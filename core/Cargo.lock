@@ -197,30 +197,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1462739cb27611015575c0c11df5df7601141071f07518d56fcc1be504cbec97"
 
 [[package]]
-name = "codecrafters-bittorrent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "data-encoding",
- "env_logger",
- "hex",
- "log",
- "percent-encoding",
- "regex",
- "reqwest",
- "serde",
- "serde_bytes",
- "serde_json",
- "serde_urlencoded",
- "sha1",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -783,6 +759,30 @@ name = "log"
 version = "0.4.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
+
+[[package]]
+name = "magnetronic-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "data-encoding",
+ "env_logger",
+ "hex",
+ "log",
+ "percent-encoding",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "serde_urlencoded",
+ "sha1",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "memchr"
