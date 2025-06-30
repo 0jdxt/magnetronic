@@ -21,8 +21,11 @@ pub enum TorrentError {
     #[error("No peers available")]
     NoPeers,
 
-    #[error("Piece hash check failed for piece {0}")]
-    PieceHashMismatch(usize),
+    #[error("Peer choked")]
+    PeerChoked,
+
+    #[error("Timeout")]
+    Timeout,
 
     #[error("Magnet parsing error: {0}")]
     MagnetParse(#[from] crate::magnet::MagnetParseError),

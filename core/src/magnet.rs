@@ -45,7 +45,7 @@ pub enum MagnetParseError {
     InvalidMeta(String),
 }
 
-fn parse_magnet_link(uri: &str) -> Result<MagnetInfo, MagnetParseError> {
+fn parse_magnet_link(uri: &str) -> Result<MagnetInfo<'_>, MagnetParseError> {
     let query_start = uri.find('?').ok_or(MagnetParseError::MalformedUri)?;
     let query = &uri[query_start + 1..];
 
@@ -112,7 +112,7 @@ pub async fn fetch_torrent_info_from_magnet(
     }
 
     // let mut reader = BufReader::new(stream.try_clone()?);
-    let (reader_half, mut writer_half) = stream.into_split();
+    let (reader_half, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader_half);
     let mut msg_buf = vec![0u8; 64 * 1024];
     let message = retrieve_message(&mut reader, &mut msg_buf, None).await?;
@@ -123,7 +123,7 @@ pub async fn fetch_torrent_info_from_magnet(
         payload: b"d1:md11:ut_metadatai16eee",
     };
     log::debug!("extended: {extended:?}");
-    extended.send(&mut writer_half).await?;
+    extended.send(&mut writer).await?;
 
     let reply = retrieve_message(&mut reader, &mut msg_buf, None).await?;
     if !matches!(reply, peer::Message::Extended { .. }) {
@@ -148,7 +148,7 @@ pub async fn fetch_torrent_info_from_magnet(
         payload: b"d8:msg_typei0e5:piecei0ee",
     };
     log::debug!("{req:?}");
-    req.send(&mut writer_half).await?;
+    req.send(&mut writer).await?;
 
     let msg = retrieve_message(&mut reader, &mut msg_buf, None).await?;
     if !matches!(msg, peer::Message::Extended { .. }) {
@@ -205,6 +205,6 @@ pub async fn fetch_torrent_info_from_magnet(
             },
             peers,
         },
-        (reader, writer_half),
+        (reader, writer),
     ))
 }

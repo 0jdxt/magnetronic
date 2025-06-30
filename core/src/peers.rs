@@ -40,7 +40,7 @@ pub async fn request_peers<'i, I: NeedsPeers<'i>>(
     // Parse response for peers (compact format)
 
     let info_hash_encoded = percent_encode(info.get_hash(), NON_ALPHANUMERIC).to_string();
-    let peer_id_encoded = percent_encode(crate::PEER_ID, NON_ALPHANUMERIC).to_string();
+    let peer_id_encoded = percent_encode(&*crate::PEER_ID, NON_ALPHANUMERIC).to_string();
 
     let url = format!(
         "{}?info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left={}&compact=1&event=started",

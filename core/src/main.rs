@@ -8,102 +8,202 @@ mod peer;
 mod peers;
 mod torrent;
 
+#[cfg(test)]
+mod tests;
+
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::time::Duration;
+
 // modules
 use error::TorrentError;
 use magnet::fetch_torrent_info_from_magnet;
 use magnet::MagnetInfo;
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 use torrent::parse_torrent_file;
 use torrent::TorrentInfo;
 // cargo
-use sha1::{Digest, Sha1};
+use rand::Rng;
 use tokio::{
     fs::OpenOptions,
     io::{AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
     net::TcpStream,
 };
 
+use crate::handshake::handshake;
 use crate::peer::{retrieve_message, Message};
 
-const PEER_ID: &[u8; 20] = b"-TR2940-6wfG2wk6wWLc";
+static PEER_ID_PREFIX: &[u8; 8] = b"-MG0001-";
+static PEER_ID: LazyLock<[u8; 20]> = LazyLock::new(|| {
+    let mut id = [0u8; 20];
+    id[0..8].copy_from_slice(PEER_ID_PREFIX);
+    id[8..20].copy_from_slice(&rand::rng().random::<[u8; 12]>());
+    log::info!("Generated Peer ID: {}", hex::encode(id));
+    id
+});
 const BLOCK_SIZE: usize = 16 * 1024; // 16KB blocks
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1MB max
 
-#[allow(clippy::too_many_lines)]
-#[tokio::main]
-async fn main() -> Result<(), error::TorrentError> {
+pub async fn run(
+    args: Vec<String>,
+    test_torrent: Option<TorrentInfo>,
+) -> Result<(), error::TorrentError> {
     env_logger::Builder::from_default_env()
         .format_target(false)
         .format_file(true)
         .format_timestamp(None)
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <torrent | magnet>", args[0]);
         std::process::exit(1);
     }
 
-    let (torrent, (mut reader, mut writer_half)) = if args[1].starts_with("magnet:?") {
+    let (torrent, initial_stream) = if args[1].starts_with("magnet:?") {
         let (t, (r, mut w)) = fetch_torrent_info_from_magnet(&args[1]).await?;
         peer::Message::Interested.send(&mut w).await?;
-        (t, (r, w))
+        (t, Some((r, w)))
+    } else if let Some(mut torrent) = test_torrent {
+        if torrent.peers.is_empty() {
+            log::debug!("Fetching peers for test torrent");
+            torrent.peers = peers::request_peers(&torrent).await?;
+        } else {
+            log::debug!("Using test-provided peers: {:?}", torrent.peers);
+        }
+        (torrent, None)
     } else {
-        let bytes = std::fs::read(&args[1]).unwrap();
+        let bytes = std::fs::read(&args[1])?;
+        if bytes.is_empty() {
+            return Err(TorrentError::TorrentParse("Empty torrent file".into()));
+        }
 
         let (torrent_info_dict, _) = bencode::decode(&bytes)?;
         log::debug!("{torrent_info_dict}");
 
-        let mut t =
-            parse_torrent_file(&torrent_info_dict).expect("Failed to get TorrentInfo from file");
+        let mut t = parse_torrent_file(&torrent_info_dict)?;
         t.peers = peers::request_peers(&t).await?;
 
-        let peer = t.peers[0];
-        log::info!("Connecting to {peer}");
-        let mut stream = TcpStream::connect(peer).await?;
-
-        handshake::handshake(&mut stream, &t.info_hash).await?;
-        let (r, w) = stream.into_split();
-        (t, (BufReader::new(r), w))
+        (t, None)
     };
     log::debug!("TorrentInfo: {torrent:?}");
 
+    let availability = Arc::new(Mutex::new(vec![0u8; torrent.piece_hashes.len()]));
+    let completed = Arc::new(Mutex::new(vec![false; torrent.piece_hashes.len()]));
+    let torrent = Arc::new(torrent);
+    let mut join_set = JoinSet::new();
+
+    if let Some((reader, writer)) = initial_stream {
+        let torrent = Arc::clone(&torrent);
+        let availability = Arc::clone(&availability);
+        let completed = Arc::clone(&completed);
+        join_set.spawn(handle_peer(
+            reader,
+            writer,
+            torrent,
+            availability,
+            completed,
+        ));
+    }
+
+    for peer in &torrent.peers {
+        log::info!("Connecting to {peer}");
+        match TcpStream::connect(peer).await {
+            Ok(mut stream) => match handshake(&mut stream, &torrent.info_hash).await {
+                Ok(_) => {
+                    let (reader, writer) = stream.into_split();
+                    let torrent = Arc::clone(&torrent);
+                    let availability = Arc::clone(&availability);
+                    let completed = Arc::clone(&completed);
+                    join_set.spawn(handle_peer(
+                        BufReader::new(reader),
+                        writer,
+                        torrent,
+                        availability,
+                        completed,
+                    ));
+                }
+                Err(e) => log::warn!("Handshake failed for peer {peer}: {e}"),
+            },
+            Err(e) => log::warn!("Failed to connect to peer {peer}: {e}"),
+        }
+    }
+
+    while !completed.lock().await.iter().all(|&done| done) {
+        while let Some(result) = join_set.join_next().await {
+            if let Err(e) = result {
+                log::warn!("Peer task failed: {e}");
+            }
+        }
+        if join_set.is_empty() && !completed.lock().await.iter().all(|&done| done) {
+            log::error!("No active peers and download incomplete");
+            return Err(TorrentError::NoPeers);
+        }
+    }
+
+    log::info!("{} downloaded", torrent.filename);
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_peer(
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+    torrent: Arc<TorrentInfo>,
+    availability: Arc<tokio::sync::Mutex<Vec<u8>>>,
+    completed: Arc<tokio::sync::Mutex<Vec<bool>>>,
+) -> Result<(), TorrentError> {
     let bitfield_len = torrent.piece_hashes.len().div_ceil(8);
     let empty_bitfield = vec![0u8; bitfield_len];
     peer::Message::Bitfield(&empty_bitfield)
-        .send(&mut writer_half)
+        .send(&mut writer)
         .await?;
 
-    let mut availability = vec![0u8; torrent.piece_hashes.len()];
-    log::info!("Waiting for Unchoke");
-
     let mut buffer = vec![0u8; torrent.piece_length];
-    loop {
-        let message = retrieve_message(&mut reader, &mut buffer, Some(&torrent)).await?;
-        log::debug!("Recieved: {message:?}");
+    let mut peer_availability = vec![false; torrent.piece_hashes.len()];
 
-        let reply = match message {
-            peer::Message::Bitfield(field) => {
-                for (i, byte) in field.iter().enumerate() {
-                    for bit_pos in 0..8 {
-                        let piece_index = i * 8 + bit_pos;
-                        if byte & (0x80 >> bit_pos) != 0 {
-                            availability[piece_index] = availability[piece_index].saturating_add(1);
+    log::info!("Waiting for Unchoke from peer");
+    match timeout(Duration::from_secs(30), async {
+        loop {
+            let message = retrieve_message(&mut reader, &mut buffer, Some(&torrent)).await?;
+            log::debug!("Recieved from peer: {message:?}");
+
+            match message {
+                peer::Message::Bitfield(field) => {
+                    for (i, byte) in field.iter().enumerate() {
+                        for bit_pos in 0..8 {
+                            let piece_index = i * 8 + bit_pos;
+                            if piece_index < torrent.piece_hashes.len()
+                                && byte & (0x80 >> bit_pos) != 0
+                            {
+                                peer_availability[piece_index] = true;
+                                availability.lock().await[piece_index] =
+                                    availability.lock().await[piece_index].saturating_add(1);
+                            }
                         }
                     }
+                    log::debug!("availability: {availability:?}");
+                    peer::Message::Interested.send(&mut writer).await?;
                 }
-                log::debug!("availability: {availability:?}");
-                peer::Message::Interested
+                peer::Message::KeepAlive => peer::Message::KeepAlive.send(&mut writer).await?,
+                peer::Message::Unchoke => {
+                    return Ok(());
+                }
+                peer::Message::Choke => {
+                    return Err(TorrentError::PeerChoked);
+                }
+                m => log::warn!("Unexpected message waiting for Unchoke: {m:?}"),
             }
-            peer::Message::KeepAlive => peer::Message::KeepAlive,
-            peer::Message::Unchoke => break,
-            m => {
-                log::warn!("Unexpected message waiting for Unchoke: {m:?}");
-                continue;
-            }
-        };
-
-        log::debug!("Sent: {reply:?}");
-        reply.send(&mut writer_half).await?;
+        }
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(TorrentError::Timeout),
     }
 
     let mut file = OpenOptions::new()
@@ -117,8 +217,14 @@ async fn main() -> Result<(), error::TorrentError> {
     file.set_len(torrent.total_length).await?;
 
     for (i, expected_hash) in torrent.piece_hashes.iter().enumerate() {
-        log::info!("Downloading piece {i}");
+        if completed.lock().await[i] {
+            continue;
+        }
+        if !peer_availability[i] {
+            continue;
+        }
 
+        log::info!("Downloading piece {i} form peer");
         let piece_offset = i * torrent.piece_length;
         let length = {
             let remaining = torrent
@@ -129,22 +235,21 @@ async fn main() -> Result<(), error::TorrentError> {
             remaining
                 .min(torrent.piece_length as u64)
                 .try_into()
-                .map_err(|_| TorrentError::TorrentParse("piece length exceeds usize".into()))?
+                .map_err(|_| TorrentError::TorrentParse("Piece length exceeds usize".into()))?
         };
 
         let mut piece = peer::Piece::new(length, BLOCK_SIZE);
 
         if let Some((begin, length)) = piece.next_request() {
             Message::make_request(i, begin, length)?
-                .send(&mut writer_half)
+                .send(&mut writer)
                 .await?;
         }
 
         loop {
             let message = retrieve_message(&mut reader, &mut buffer, Some(&torrent)).await?;
 
-            let reply = match message {
-                peer::Message::KeepAlive => peer::Message::KeepAlive,
+            match message {
                 peer::Message::Piece {
                     index,
                     begin,
@@ -157,45 +262,45 @@ async fn main() -> Result<(), error::TorrentError> {
                         block.len()
                     );
 
-                    piece.write_block(begin as usize, block);
+                    piece.write_block(begin as usize, block)?;
                     if piece.is_complete() {
                         break;
                     }
 
                     if let Some((next_begin, next_length)) = piece.next_request() {
                         Message::make_request(i, next_begin, next_length)?
-                    } else {
-                        continue;
+                            .send(&mut writer)
+                            .await?;
                     }
                 }
-                m => {
-                    log::warn!("Unexpected message waiting for Piece: {m:?}");
-                    continue;
-                }
-            };
-
-            log::debug!("Sent: {reply:?}");
-            reply.send(&mut writer_half).await?;
+                peer::Message::KeepAlive => peer::Message::KeepAlive.send(&mut writer).await?,
+                m => log::warn!("Unexpected message waiting for Piece: {m:?}"),
+            }
         }
 
-        if Sha1::digest(&piece.data).as_slice() != expected_hash.as_slice() {
-            return Err(error::TorrentError::PieceHashMismatch(i));
+        match piece.verify_hash(expected_hash) {
+            Ok(()) => {
+                file.seek(SeekFrom::Start(piece_offset as u64)).await?;
+                file.write_all(&piece.data).await?;
+                completed.lock().await[i] = true;
+                log::info!(
+                    "Wrote {} bytes to {} @ {}",
+                    piece.data.len(),
+                    torrent.filename,
+                    piece_offset
+                );
+            }
+            Err(e) => log::error!("Piece {i} verification failed: {e}"),
         }
-
-        log::debug!("first bytes: {:?}", &piece.data[..10]);
-        log::debug!("last byte: {:?}", &piece.data[piece.data.len() - 1]);
-
-        log::info!(
-            "Writing {} bytes to {} @ {}",
-            piece.data.len(),
-            torrent.filename,
-            piece_offset
-        );
-        file.seek(SeekFrom::Start(piece_offset as u64)).await?;
-        file.write_all(&piece.data).await?;
     }
 
-    log::info!("{} downloaded.", torrent.filename);
-
     Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run(std::env::args().collect(), None).await {
+        log::error!("Error: {e}");
+        std::process::exit(1);
+    }
 }

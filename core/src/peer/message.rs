@@ -1,8 +1,5 @@
 use thiserror::Error;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::TorrentError;
 use crate::TorrentInfo;
@@ -70,10 +67,26 @@ pub enum MessageParseError {
         block_len: usize,
         piece_len: usize,
     },
+
+    #[error("Hash mismatch. Actual: {actual:?}, expected: {expected:?}")]
+    PieceHashMismatch {
+        expected: [u8; 20],
+        actual: [u8; 20],
+    },
+
+    #[error("Invalid block: {begin}")]
+    InvalidBlock {
+        begin: usize,
+        block_len: usize,
+        piece_len: usize,
+    },
+
+    #[error("Tried to write block more than once: {index}")]
+    DuplicateBlock { index: usize },
 }
 
-pub async fn retrieve_message<'a>(
-    reader: &'a mut BufReader<OwnedReadHalf>,
+pub async fn retrieve_message<'a, R: AsyncReadExt + Unpin>(
+    reader: &'a mut BufReader<R>,
     buffer: &'a mut [u8],
     torrent: Option<&'a TorrentInfo>,
 ) -> Result<Message<'a>, TorrentError> {
@@ -175,7 +188,7 @@ impl Message<'_> {
         })
     }
 
-    pub async fn send(&self, w: &mut OwnedWriteHalf) -> Result<(), TorrentError> {
+    pub async fn send<W: AsyncWriteExt + Unpin>(&self, w: &mut W) -> Result<(), TorrentError> {
         w.write_all(&self.to_bytes()?)
             .await
             .map_err(TorrentError::Io)
