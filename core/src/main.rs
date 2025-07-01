@@ -48,6 +48,9 @@ static PEER_ID: LazyLock<[u8; 20]> = LazyLock::new(|| {
 const BLOCK_SIZE: usize = 16 * 1024; // 16KB blocks
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1MB max
 
+/// # Errors
+///
+/// at the moment will bubble up many errors before proper handling is done.
 pub async fn run(
     args: Vec<String>,
     test_torrent: Option<TorrentInfo>,
@@ -162,7 +165,7 @@ async fn handle_peer(
         .send(&mut writer)
         .await?;
 
-    let mut buffer = vec![0u8; torrent.piece_length];
+    let mut buffer = vec![0u8; MAX_MESSAGE_SIZE as usize];
     let mut peer_availability = vec![false; torrent.piece_hashes.len()];
 
     log::info!("Waiting for Unchoke from peer");
@@ -173,6 +176,7 @@ async fn handle_peer(
 
             match message {
                 peer::Message::Bitfield(field) => {
+                    let mut avail = availability.lock().await;
                     for (i, byte) in field.iter().enumerate() {
                         for bit_pos in 0..8 {
                             let piece_index = i * 8 + bit_pos;
@@ -180,12 +184,12 @@ async fn handle_peer(
                                 && byte & (0x80 >> bit_pos) != 0
                             {
                                 peer_availability[piece_index] = true;
-                                availability.lock().await[piece_index] =
-                                    availability.lock().await[piece_index].saturating_add(1);
+                                avail[piece_index] = avail[piece_index].saturating_add(1);
                             }
                         }
                     }
                     log::debug!("availability: {availability:?}");
+                    log::debug!("peer availability: {peer_availability:?}");
                     peer::Message::Interested.send(&mut writer).await?;
                 }
                 peer::Message::KeepAlive => peer::Message::KeepAlive.send(&mut writer).await?,
@@ -210,7 +214,7 @@ async fn handle_peer(
         .read(true)
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .open(&torrent.filename)
         .await?;
 
@@ -218,13 +222,15 @@ async fn handle_peer(
 
     for (i, expected_hash) in torrent.piece_hashes.iter().enumerate() {
         if completed.lock().await[i] {
+            log::info!("Piece {i} already downloaded; skipping");
             continue;
         }
         if !peer_availability[i] {
+            log::info!("Piece {i} not available");
             continue;
         }
 
-        log::info!("Downloading piece {i} form peer");
+        log::info!("Downloading piece {i} from peer");
         let piece_offset = i * torrent.piece_length;
         let length = {
             let remaining = torrent

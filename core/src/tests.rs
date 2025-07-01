@@ -10,7 +10,7 @@ use mockito::Matcher;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
 
@@ -49,40 +49,40 @@ async fn test_download_with_non_ascii_peer_id_and_invalid_block() {
     tokio::spawn(async move {
         let mut buf = [0u8; 68];
         if let Err(e) = server.read_exact(&mut buf).await {
-            log::error!("Server read handshake error: {}", e);
+            log::error!("Server read handshake error: {e}");
             return;
         }
         let handshake = Handshake::new(&torrent.info_hash, peer_id);
         if let Err(e) = server.write_all(&handshake.0).await {
-            log::error!("Server write handshake error: {}", e);
+            log::error!("Server write handshake error: {e}");
             return;
         }
         let bitfield = Message::Bitfield(&[0b1]);
         if let Err(e) = server.write_all(&bitfield.to_bytes().unwrap()).await {
-            log::error!("Server write bitfield error: {}", e);
+            log::error!("Server write bitfield error: {e}");
             return;
         }
         let mut len_buf = [0u8; 4];
         if let Err(e) = server.read_exact(&mut len_buf).await {
-            log::error!("Server read interested len error: {}", e);
+            log::error!("Server read interested len error: {e}");
             return;
         }
         if let Err(e) = server.read_exact(&mut [0u8; 1]).await {
-            log::error!("Server read interested error: {}", e);
+            log::error!("Server read interested error: {e}");
             return;
         } // Interested
         let unchoke = Message::Unchoke;
         if let Err(e) = server.write_all(&unchoke.to_bytes().unwrap()).await {
-            log::error!("Server write unchoke error: {}", e);
+            log::error!("Server write unchoke error: {e}");
             return;
         }
         if let Err(e) = server.read_exact(&mut len_buf).await {
-            log::error!("Server read request len error: {}", e);
+            log::error!("Server read request len error: {e}");
             return;
         }
         let mut req_buf = [0u8; 13];
         if let Err(e) = server.read_exact(&mut req_buf).await {
-            log::error!("Server read request error: {}", e);
+            log::error!("Server read request error: {e}");
             return;
         }
         let piece_data = vec![42u8; 256];
@@ -92,15 +92,15 @@ async fn test_download_with_non_ascii_peer_id_and_invalid_block() {
             block: &piece_data,
         };
         if let Err(e) = server.write_all(&piece_msg.to_bytes().unwrap()).await {
-            log::error!("Server write piece error: {}", e);
+            log::error!("Server write piece error: {e}");
             return;
         }
         if let Err(e) = server.read_exact(&mut len_buf).await {
-            log::error!("Server read second request len error: {}", e);
+            log::error!("Server read second request len error: {e}");
             return;
         }
         if let Err(e) = server.read_exact(&mut req_buf).await {
-            log::error!("Server read second request error: {}", e);
+            log::error!("Server read second request error: {e}");
             return;
         }
         let invalid_msg = Message::Piece {
@@ -109,7 +109,7 @@ async fn test_download_with_non_ascii_peer_id_and_invalid_block() {
             block: &piece_data,
         };
         if let Err(e) = server.write_all(&invalid_msg.to_bytes().unwrap()).await {
-            log::error!("Server write invalid piece error: {}", e);
+            log::error!("Server write invalid piece error: {e}");
         }
     });
 
@@ -151,7 +151,7 @@ async fn test_download_with_non_ascii_peer_id_and_invalid_block() {
     .unwrap()
     .unwrap();
     if let Message::Piece {
-        index,
+        index: _,
         begin,
         block,
     } = message
@@ -200,6 +200,7 @@ async fn test_main_multi_peer() {
         peers: vec![
             "127.0.0.1:6881".parse().unwrap(),
             "127.0.0.1:6882".parse().unwrap(),
+            "127.0.0.1:6883".parse().unwrap(),
         ],
     });
 
@@ -213,6 +214,7 @@ async fn test_main_multi_peer() {
                 Value::ByteString(vec![
                     127, 0, 0, 1, 26, 225, // 127.0.0.1:6881
                     127, 0, 0, 1, 26, 226, // 127.0.0.1:6882
+                    127, 0, 0, 1, 26, 227, // 127.0.0.1:6883
                 ]),
             );
             map
@@ -220,56 +222,69 @@ async fn test_main_multi_peer() {
         .create_async()
         .await;
 
-    for port in [6881, 6882] {
+    for port in [6881, 6882, 6883] {
         let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
         let torrent = Arc::clone(&torrent);
+        let block_data = block_data.clone();
         tokio::spawn(async move {
             match timeout(Duration::from_secs(10), async {
                 let (stream, _) = listener.accept().await?;
-                let (mut reader, mut writer) = stream.into_split();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
                 let mut buf = [0u8; 68];
+                log::debug!("Server waiting for handshake on port {port}");
                 if reader.read_exact(&mut buf).await.is_err() {
                     log::error!("Server failed to read handshake on port {port}");
-                    return Ok::<(), TorrentError>(());
+                    return Ok::<(),TorrentError>(());
                 }
                 let handshake = Handshake::new(&torrent.info_hash, &[0xFF; 20]);
                 writer.write_all(&handshake.0).await?;
-                let bitfield = Message::Bitfield(&[0b1]);
+                log::debug!("Server sent handshake on port {port}");
+                let bitfield = Message::Bitfield(&[0b1000_0000]);
                 writer.write_all(&bitfield.to_bytes().unwrap()).await?;
-                let mut len_buf = [0u8; 4];
-                if reader.read_exact(&mut len_buf).await.is_err() {
-                    log::error!("Server failed to read interested len on port {port}");
+                log::debug!("Server sent Bitfield on port {port}");
+                // Loop to handle messages until Interested
+                let mut interested_received = false;
+                let mut buf = vec![0u8; crate::MAX_MESSAGE_SIZE as usize];
+                while !interested_received {
+
+                    let message = crate::peer::retrieve_message(&mut reader, &mut buf, Some(&torrent)).await?;
+                    log::debug!("Server received message {message:?} on port {port}");
+                    match message {
+                        Message::KeepAlive => {
+                            Message::KeepAlive.send(&mut writer).await?;
+                            log::debug!("Server sent KeepAlive on port {port}");
+                        }
+                        Message::Bitfield(_) => {
+                            log::debug!("Server received Bitfield on port {port}");
+                        }
+                        Message::Interested => {
+                            log::debug!("Server received Interested on port {port}");
+                            interested_received = true;
+                        }
+                        m => log::warn!("Unexpected message {m:?} on port {port}"),
+                    }
+                }
+                 Message::Unchoke.send(&mut writer).await?;
+                log::debug!("Server sent Unchoke on port {port}");
+                // Read and validate Request message
+                let request = crate::peer::retrieve_message(&mut reader, &mut buf, Some(&torrent)).await?;
+                    if let Message::Request {..}  = request {
+                        log::debug!("Server received valid Request (index=0, begin=0, length=512) on port {port}");
+                    } else {
+                        log::error!("Expected request (index=0, begin=0, length=512), got {request:?} on port {port}");
                     return Ok(());
                 }
-                if reader.read_exact(&mut [0u8; 1]).await.is_err() {
-                    log::error!("Server failed to read interested on port {port}");
-                    return Ok(());
-                } // Interested
-                let unchoke = Message::Unchoke;
-                writer.write_all(&unchoke.to_bytes().unwrap()).await?;
-                if reader.read_exact(&mut len_buf).await.is_err() {
-                    log::error!("Server failed to read request len on port {port}");
-                    return Ok(());
-                }
-                let mut req_buf = [0u8; 13];
-                if reader.read_exact(&mut req_buf).await.is_err() {
-                    log::error!(
-                        "Server failed to read request on port {port} {len_buf:?} {req_buf:?}"
-                    );
-                    return Ok(());
-                }
-                let piece_data = vec![42u8; 512];
-                let piece_msg = Message::Piece {
+                 Message::Piece {
                     index: 0,
                     begin: 0,
-                    block: &piece_data,
-                };
-                writer.write_all(&piece_msg.to_bytes().unwrap()).await?;
-                log::debug!(
-                    "Server sent Piece {{ index: 0, begin: 0, block: 512 bytes }} on port {port}"
-                );
+                    block: &block_data,
+                }.send(&mut writer).await?;
+                log::debug!("Server sent Piece {{ index: 0, begin: 0, block: 512 bytes }} on port {port}");
+                // Keep mock peer alive
+                let mut len_buf = [0; 4];
                 loop {
                     if reader.read_exact(&mut len_buf).await.is_err() {
                         log::debug!("Server on port {port} finished or client closed connection");
@@ -281,8 +296,12 @@ async fn test_main_multi_peer() {
                         writer.write_all(&keep_alive.to_bytes().unwrap()).await?;
                         log::debug!("Server sent KeepAlive on port {port}");
                     } else {
-                        log::warn!("Unexpected message length {len} on port {port}");
-                        return Ok(());
+                        let mut discard_buf = vec![0u8; len as usize];
+                        if reader.read_exact(&mut discard_buf).await.is_err() {
+                            log::debug!("Server on port {port} failed to read unexpected message");
+                            return Ok(());
+                        }
+                        log::warn!("Unexpected message length {len} with data {discard_buf:?} on port {port}");
                     }
                 }
             })
@@ -299,7 +318,7 @@ async fn test_main_multi_peer() {
     let path = temp_file.path().to_str().unwrap().to_string();
     std::fs::write(&path, b"").unwrap(); // Mock .torrent file
     let args = vec!["magnetronic".to_string(), path];
-    tokio::time::sleep(Duration::from_secs(1)).await; // Ensure servers are ready
+    tokio::time::sleep(Duration::from_secs(2)).await; // Increased delay
     crate::run(args, Some(torrent.as_ref().clone()))
         .await
         .unwrap();
