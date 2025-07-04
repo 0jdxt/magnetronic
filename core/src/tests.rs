@@ -327,3 +327,149 @@ async fn test_main_multi_peer() {
     assert_eq!(data.len(), torrent.total_length as usize);
     assert_eq!(&data[..512], &vec![42u8; 512]);
 }
+
+#[tokio::test]
+async fn test_main_two_peers_one_piece() -> Result<(), TorrentError> {
+    env_logger::init();
+    let mut server = mockito::Server::new_async().await;
+    let tracker_url = server.url();
+    let _m = server
+        .mock("GET", "/")
+        .with_status(200)
+        .with_body(crate::bencode::encode(&{
+            let mut m = HashMap::new();
+            m.insert(
+                Key(b"peers".to_vec()),
+                Value::ByteString(vec![
+                    127, 0, 0, 1, 26, 228, // 127.0.0.1:6884
+                    127, 0, 0, 1, 26, 229, // 127.0.0.1:6885
+                ]),
+            );
+            Value::Dict(m)
+        }))
+        .create_async()
+        .await;
+
+    let torrent = TorrentInfo {
+        info_hash: [0u8; 20],
+        piece_length: 32 * 1024,
+        total_length: 32 * 1024,
+        piece_hashes: vec![sha1::Sha1::digest(vec![42u8; 512]).into()],
+        trackers: vec![tracker_url],
+        filename: String::from("test_multi.txt"),
+        peers: vec![
+            "127.0.0.1:6884".parse().unwrap(),
+            "127.0.0.1:6885".parse().unwrap(),
+        ],
+    };
+
+    let torrent_ref = Arc::new(torrent.clone());
+    let torrent_file = tempfile::NamedTempFile::new()?;
+    let args = vec![
+        "magnetronic".to_string(),
+        torrent_file.path().to_string_lossy().into(),
+    ];
+    let mut join_set: tokio::task::JoinSet<Result<(), TorrentError>> = tokio::task::JoinSet::new();
+
+    // Spawn two mock peers
+    for (port, begin, length) in [(6884, 0, 16 * 1024), (6885, 16 * 1024, 16 * 1024)] {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+        let torrent_ref = Arc::clone(&torrent_ref);
+        join_set.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.split();
+            let mut reader = BufReader::new(reader);
+
+            // Handshake
+            let mut handshake_buf = [0u8; 68];
+            reader.read_exact(&mut handshake_buf).await.unwrap();
+            let handshake = Handshake::new(&torrent_ref.info_hash, &[0xFF; 20]);
+            writer.write_all(&handshake.0).await.unwrap();
+            log::debug!("Server sent handshake on port {}", port);
+
+            // Send Bitfield
+            let bitfield = Message::Bitfield(&[0x80]);
+            bitfield.send(&mut writer).await.unwrap();
+            log::debug!("Server sent Bitfield on port {}", port);
+
+            // Handle messages until Interested
+            let mut buffer = vec![0u8; torrent_ref.piece_length];
+            let mut interested_received = false;
+            while !interested_received {
+                let message = crate::peer::retrieve_message(&mut reader, &mut buffer, Some(&torrent_ref))
+                    .await
+                    .unwrap();
+                log::debug!("Server received message {message:?} on port {}", port);
+                match message {
+                    Message::KeepAlive => {
+                        Message::KeepAlive.send(&mut writer).await.unwrap();
+                        log::debug!("Server sent KeepAlive on port {}", port);
+                    }
+                    Message::Bitfield(_) => {
+                        log::debug!("Server received Bitfield on port {}", port);
+                    }
+                    Message::Interested => {
+                        log::debug!("Server received Interested on port {}", port);
+                        interested_received = true;
+                    }
+                    m => log::warn!("Unexpected message {m:?} on port {}", port),
+                }
+            }
+
+            // Send Unchoke
+            Message::Unchoke.send(&mut writer).await.unwrap();
+            log::debug!("Server sent Unchoke on port {}", port);
+
+            // Handle Request
+            let message = timeout(Duration::from_secs(2), crate::peer::retrieve_message(&mut reader, &mut buffer, Some(&torrent_ref)))
+                .await
+                .map_err(|_| {
+                    log::error!("Timeout waiting for Request on port {}", port);
+                    TorrentError::Timeout
+                })
+                .unwrap()?;
+            log::debug!("Server received message {message:?} on port {}", port);
+            if let Message::Request { index, begin: req_begin, length: req_length } = message {
+                if index == 0 && req_begin == begin && req_length == length {
+                    let block_data = vec![42u8; length as usize];
+                    Message::Piece {
+                        index: 0,
+                        begin,
+                        block: &block_data,
+                    }
+                    .send(&mut writer)
+                    .await
+                    .unwrap();
+                    log::debug!("Server sent Piece {{ index: 0, begin: {}, block: {} bytes }} on port {}", begin, length, port);
+                } else {
+                    log::error!("Expected request (index=0, begin={}, length={}), got {index}, {req_begin}, {req_length} on port {}", begin, length, port);
+                    return Ok(());
+                }
+            } else {
+                log::error!("Expected Request, got {message:?} on port {}", port);
+                return Ok(());
+            }
+
+            // Keep connection alive
+            loop {
+                let message = crate::peer::retrieve_message(&mut reader, &mut buffer, Some(&torrent_ref))
+                    .await
+                    .unwrap();
+                log::debug!("Server received message {message:?} on port {}", port);
+                if let Message::KeepAlive = message {
+                    Message::KeepAlive.send(&mut writer).await.unwrap();
+                    log::debug!("Server sent KeepAlive on port {}", port);
+                }
+            }
+        });
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    crate::run(args, Some(torrent)).await.unwrap();
+
+    // Check file
+    let contents = tokio::fs::read("test_multi.txt").await.unwrap();
+    assert_eq!(contents.len(), 32 * 1024);
+    assert!(contents.iter().all(|&byte| byte == 42));
+    Ok(())
+}

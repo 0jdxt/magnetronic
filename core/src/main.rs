@@ -55,12 +55,6 @@ pub async fn run(
     args: Vec<String>,
     test_torrent: Option<TorrentInfo>,
 ) -> Result<(), error::TorrentError> {
-    env_logger::Builder::from_default_env()
-        .format_target(false)
-        .format_file(true)
-        .format_timestamp(None)
-        .init();
-
     if args.len() != 2 {
         eprintln!("Usage: {} <torrent | magnet>", args[0]);
         std::process::exit(1);
@@ -99,20 +93,28 @@ pub async fn run(
     let torrent = Arc::new(torrent);
     let mut join_set = JoinSet::new();
 
+    let queue = Arc::new(Mutex::new(
+        (0..torrent.piece_hashes.len()).collect::<Vec<usize>>(),
+    ));
+
+    let mut is_magnet = false;
     if let Some((reader, writer)) = initial_stream {
+        is_magnet = true;
         let torrent = Arc::clone(&torrent);
         let availability = Arc::clone(&availability);
         let completed = Arc::clone(&completed);
+        let queue = Arc::clone(&queue);
         join_set.spawn(handle_peer(
             reader,
             writer,
             torrent,
             availability,
             completed,
+            queue,
         ));
     }
 
-    for peer in &torrent.peers {
+    for peer in torrent.peers.iter().skip(is_magnet.into()) {
         log::info!("Connecting to {peer}");
         match TcpStream::connect(peer).await {
             Ok(mut stream) => match handshake(&mut stream, &torrent.info_hash).await {
@@ -121,12 +123,14 @@ pub async fn run(
                     let torrent = Arc::clone(&torrent);
                     let availability = Arc::clone(&availability);
                     let completed = Arc::clone(&completed);
+                    let queue = Arc::clone(&queue);
                     join_set.spawn(handle_peer(
                         BufReader::new(reader),
                         writer,
                         torrent,
                         availability,
                         completed,
+                        queue,
                     ));
                 }
                 Err(e) => log::warn!("Handshake failed for peer {peer}: {e}"),
@@ -156,8 +160,9 @@ async fn handle_peer(
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: OwnedWriteHalf,
     torrent: Arc<TorrentInfo>,
-    availability: Arc<tokio::sync::Mutex<Vec<u8>>>,
-    completed: Arc<tokio::sync::Mutex<Vec<bool>>>,
+    availability: Arc<Mutex<Vec<u8>>>,
+    completed: Arc<Mutex<Vec<bool>>>,
+    queue: Arc<Mutex<Vec<usize>>>,
 ) -> Result<(), TorrentError> {
     let bitfield_len = torrent.piece_hashes.len().div_ceil(8);
     let empty_bitfield = vec![0u8; bitfield_len];
@@ -217,10 +222,10 @@ async fn handle_peer(
         .truncate(false)
         .open(&torrent.filename)
         .await?;
-
     file.set_len(torrent.total_length).await?;
 
-    for (i, expected_hash) in torrent.piece_hashes.iter().enumerate() {
+    // for (i, expected_hash) in torrent.piece_hashes.iter().enumerate() {
+    while let Some(i) = queue.lock().await.pop() {
         if completed.lock().await[i] {
             log::info!("Piece {i} already downloaded; skipping");
             continue;
@@ -247,9 +252,16 @@ async fn handle_peer(
         let mut piece = peer::Piece::new(length, BLOCK_SIZE);
 
         if let Some((begin, length)) = piece.next_request() {
-            Message::make_request(i, begin, length)?
-                .send(&mut writer)
-                .await?;
+            match timeout(
+                Duration::from_secs(10),
+                Message::make_request(i, begin, length)?.send(&mut writer),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                _ => return Err(TorrentError::Timeout),
+            }
         }
 
         loop {
@@ -274,9 +286,16 @@ async fn handle_peer(
                     }
 
                     if let Some((next_begin, next_length)) = piece.next_request() {
-                        Message::make_request(i, next_begin, next_length)?
-                            .send(&mut writer)
-                            .await?;
+                        match timeout(
+                            Duration::from_secs(10),
+                            Message::make_request(i, next_begin, next_length)?.send(&mut writer),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(e),
+                            Err(_) => return Err(TorrentError::Timeout),
+                        }
                     }
                 }
                 peer::Message::KeepAlive => peer::Message::KeepAlive.send(&mut writer).await?,
@@ -284,7 +303,7 @@ async fn handle_peer(
             }
         }
 
-        match piece.verify_hash(expected_hash) {
+        match piece.verify_hash(&torrent.piece_hashes[i]) {
             Ok(()) => {
                 file.seek(SeekFrom::Start(piece_offset as u64)).await?;
                 file.write_all(&piece.data).await?;
@@ -295,8 +314,13 @@ async fn handle_peer(
                     torrent.filename,
                     piece_offset
                 );
+                peer::Message::Have(i as u32).send(&mut writer).await?;
+                log::debug!("Sent Have({i}) to peer");
             }
-            Err(e) => log::error!("Piece {i} verification failed: {e}"),
+            Err(e) => {
+                log::error!("Piece {i} verification failed: {e}");
+                queue.lock().await.push(i);
+            }
         }
     }
 
@@ -305,6 +329,12 @@ async fn handle_peer(
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::from_default_env()
+        .format_target(false)
+        .format_file(true)
+        .format_timestamp(None)
+        .init();
+
     if let Err(e) = run(std::env::args().collect(), None).await {
         log::error!("Error: {e}");
         std::process::exit(1);
