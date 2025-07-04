@@ -1,9 +1,10 @@
 use super::Error;
+use arbitrary::Arbitrary;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::str;
 
-#[derive(Debug, Hash, Eq, PartialEq, Clone, PartialOrd, Ord)]
+#[derive(Debug, Hash, Eq, PartialEq, Clone, PartialOrd, Ord, Arbitrary)]
 pub struct Key(pub Vec<u8>);
 
 impl TryFrom<Value> for Key {
@@ -25,7 +26,7 @@ impl Deref for Key {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Arbitrary)]
 pub enum Value {
     ByteString(Vec<u8>),
     Integer(i64),
@@ -66,32 +67,34 @@ impl Value {
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::ByteString(v) => match str::from_utf8(v) {
-                Ok(s) => write!(f, "{s}"),
-                Err(_) => write!(f, "0x{}", hex::encode(v)),
-            },
+            Value::ByteString(v) => {
+                f.write_str("\"")?;
+                match str::from_utf8(v) {
+                    Ok(s) => f.write_str(s),
+                    Err(_) => write!(f, "0x{}", hex::encode(v)),
+                }?;
+                f.write_str("\"")
+            }
             Value::Integer(n) => write!(f, "{n}"),
             Value::List(v) => {
-                write!(f, "[")?;
+                f.write_str("[")?;
                 for (i, v) in v.iter().enumerate() {
                     if i > 0 {
-                        write!(f, ", ")?;
+                        f.write_str(", ")?;
                     }
                     write!(f, "{v}")?;
                 }
-                write!(f, "]")?;
-                Ok(())
+                f.write_str("]")
             }
             Value::Dict(m) => {
-                write!(f, "{{")?;
+                f.write_str("{")?;
                 for (i, (k, v)) in m.iter().enumerate() {
                     if i > 0 {
-                        write!(f, ", ")?;
+                        f.write_str(", ")?;
                     }
                     write!(f, "{}: {}", str::from_utf8(&k.0).unwrap_or("<?>"), v)?;
                 }
-                write!(f, "}}")?;
-                Ok(())
+                f.write_str("}")
             }
         }
     }

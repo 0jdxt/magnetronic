@@ -158,3 +158,79 @@ fn test_decode_incomplete_input() {
     let err = decode(b"i42").unwrap_err();
     assert_eq!(err, Error::MissingEnd);
 }
+
+#[test]
+fn test_invalid_string_lengths() {
+    // Leading zero
+    assert!(matches!(
+        decode(b"03:foo"),
+        Err(Error::InvalidStrLen(s)) if s == "03"
+    ));
+
+    // Empty length
+    assert!(matches!(
+        decode(b":foo"),
+        Err(Error::UnhandledByte(b':', Some(':')))
+    ));
+
+    // Non-digit length
+    assert!(matches!(
+        decode(b"a3:foo"),
+        Err(Error::UnhandledByte(b'a', Some('a')))
+    ));
+
+    // Mixed garbage
+    assert!(matches!(
+        decode(b"1a:foo"),
+        Err(Error::InvalidStrLen(s)) if s == "1a"
+    ));
+
+    // Length too large
+    let big = format!("{}:{}", 10 * 1024 * 1024 + 1, "a");
+    assert!(matches!(
+        decode(big.as_bytes()),
+        Err(Error::StringTooLong(n)) if n == 10 * 1024 * 1024 + 1
+    ));
+
+    // Declared length longer than actual data
+    assert!(matches!(decode(b"5:hi"), Err(Error::UnexpectedEof)));
+
+    // Valid empty string
+    assert_eq!(
+        decode(b"0:").unwrap().0,
+        super::Value::ByteString(b"".to_vec())
+    );
+}
+
+#[test]
+fn test_invalid_integer_lengths() {
+    // Negative zero
+    assert!(matches!(
+        decode(b"i-0e"),
+        Err(Error::InvalidInteger(s)) if s == "-0"
+    ));
+
+    // Leading +ve zero
+    assert!(matches!(
+        decode(b"i0003e"),
+        Err(Error::InvalidInteger(s)) if s == "0003"
+    ));
+
+    // Leading -ve zero
+    assert!(matches!(
+        decode(b"i-0003e"),
+        Err(Error::InvalidInteger(s)) if s == "-0003"
+    ));
+
+    // Empty number
+    assert!(matches!(
+        decode(b"ie"),
+        Err(Error::InvalidInteger(s)) if s.is_empty()
+    ));
+
+    // Invalid number chars
+    assert!(matches!(decode(b"i--3e"), Err(Error::ParseInt(_))));
+
+    // Invalid number chars
+    assert!(matches!(decode(b"i2x5e"), Err(Error::ParseInt(_))));
+}
