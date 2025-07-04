@@ -1,5 +1,8 @@
+use std::time::Duration;
+
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::time::timeout;
 
 use crate::error::TorrentError;
 use crate::TorrentInfo;
@@ -91,7 +94,11 @@ pub async fn retrieve_message<'a, R: AsyncReadExt + Unpin>(
     torrent: Option<&'a TorrentInfo>,
 ) -> Result<Message<'a>, TorrentError> {
     let mut len_buf = [0; 4];
-    reader.read_exact(&mut len_buf).await?;
+
+    timeout(Duration::from_secs(10), reader.read_exact(&mut len_buf))
+        .await
+        .map_err(|_| TorrentError::Timeout)??;
+
     let length = u32::from_be_bytes(len_buf);
 
     if length == 0 {
