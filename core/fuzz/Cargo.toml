@@ -1,0 +1,28 @@
+[package]
+name = "magnetronic-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.magnetronic-core]
+path = ".."
+
+[[bin]]
+name = "bencode_decode"
+path = "fuzz_targets/bencode_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bencode_encode"
+path = "fuzz_targets/bencode_encode.rs"
+test = false
+doc = false
+bench = false
