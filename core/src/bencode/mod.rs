@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::str;
+use std::{collections::HashMap, io::Write, str};
 use thiserror::Error;
 
 pub mod value;
@@ -23,7 +22,7 @@ pub enum Error {
     NotList(Value),
 
     #[error("Invalid UTF-8 in Bencode: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
+    Utf8(#[from] str::Utf8Error),
 
     #[error("Invalid integer in Bencode: {0}")]
     ParseInt(#[from] std::num::ParseIntError),
@@ -64,7 +63,7 @@ pub const MAX_DEPTH: usize = 1024;
 /// Will return some parsing error for:
 /// - malformed input
 /// - a value exceeds 10MB in size
-/// - recursion exceeds {`MAX_DEPTH`}
+/// - nested depth exceeds {`MAX_DEPTH`}
 pub fn decode(bytes: &[u8]) -> Result<(Value, usize), Error> {
     let (value, consumed) = decode_with_depth(bytes, 0)?;
     if consumed == bytes.len() {
@@ -75,6 +74,7 @@ pub fn decode(bytes: &[u8]) -> Result<(Value, usize), Error> {
 }
 
 fn decode_with_depth(bytes: &[u8], depth: usize) -> Result<(Value, usize), Error> {
+    let depth = depth + 1;
     if depth > MAX_DEPTH {
         return Err(Error::DepthExceeded);
     }
@@ -138,14 +138,14 @@ fn decode_with_depth(bytes: &[u8], depth: usize) -> Result<(Value, usize), Error
             let mut values = Vec::new();
             let mut i = 1;
             while i < bytes.len() && bytes[i] != b'e' {
-                let (v, len) = decode_with_depth(&bytes[i..], depth + 1)?;
+                let (v, len) = decode_with_depth(&bytes[i..], depth)?;
                 values.push(v);
                 i += len;
             }
-            if i >= bytes.len() {
-                Err(Error::MissingEnd)
-            } else {
+            if i < bytes.len() {
                 Ok((Value::List(values), i + 1))
+            } else {
+                Err(Error::MissingEnd)
             }
         }
         b'd' => {
@@ -153,26 +153,25 @@ fn decode_with_depth(bytes: &[u8], depth: usize) -> Result<(Value, usize), Error
             let mut dict = HashMap::new();
             let mut i = 1;
             while i < bytes.len() && bytes[i] != b'e' {
-                let (key, len_k) = decode_with_depth(&bytes[i..], depth + 1)?;
+                let (key, len_k) = decode_with_depth(&bytes[i..], depth)?;
                 i += len_k;
                 let key = key.try_into().map_err(|_| Error::NonByteStringKey)?;
 
-                let (val, len_v) = decode_with_depth(&bytes[i..], depth + 1)?;
+                let (val, len_v) = decode_with_depth(&bytes[i..], depth)?;
                 i += len_v;
 
                 dict.insert(key, val);
             }
-            if i >= bytes.len() {
-                Err(Error::MissingEnd)
-            } else {
+            if i < bytes.len() {
                 Ok((Value::Dict(dict), i + 1))
+            } else {
+                Err(Error::MissingEnd)
             }
         }
         b => Err(Error::UnhandledByte(*b, Some(*b as char))),
     }
 }
 
-use std::io::Write;
 #[must_use]
 pub fn encode(value: &Value) -> Vec<u8> {
     match value {
